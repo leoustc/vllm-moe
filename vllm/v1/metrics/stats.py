@@ -168,6 +168,44 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class MoEOffloadStats:
+    """Stats associated with sparse-MoE CPU offload execution."""
+
+    expert_delta_load_count: int = 0
+    expert_delta_load_bytes: int = 0
+    expert_load_latency_ms: float = 0.0
+
+    tokens_per_expert_load: float = 0.0
+    bytes_loaded_per_token: float = 0.0
+    expert_reuse_before_eviction: float = 0.0
+
+    wave_count: int = 0
+    wave_token_count: int = 0
+    wave_queue_wait_ms: float = 0.0
+    wave_compute_estimate_ms: float = 0.0
+    wave_transfer_estimate_ms: float = 0.0
+    wave_projected_gpu_bytes: int = 0
+    wave_kv_bytes: int = 0
+    wave_token_buffer_bytes: int = 0
+
+    active_expert_count: int = 0
+    fallback_expert_count: int = 0
+    resident_expert_bytes: int = 0
+    expert_cache_hit_ratio: float = 1.0
+    cold_expert_eviction_count: int = 0
+
+    group_fallback_count: int = 0
+    group_fallback_exact_miss_count: int = 0
+    group_fallback_threshold_reject_count: int = 0
+
+    @property
+    def group_fallback_ratio(self) -> float:
+        if self.group_fallback_exact_miss_count == 0:
+            return 0.0
+        return self.group_fallback_count / self.group_fallback_exact_miss_count
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -189,6 +227,7 @@ class SchedulerStats:
 
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
+    moe_offload_stats: MoEOffloadStats | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)

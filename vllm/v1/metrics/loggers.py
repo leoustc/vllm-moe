@@ -23,6 +23,7 @@ from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
     IterationStats,
+    MoEOffloadStats,
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
@@ -525,6 +526,257 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
         )
+
+        gauge_moe_cpu_offload_enabled = self._gauge_cls(
+            name="vllm:moe_cpu_offload_enabled",
+            documentation="Whether sparse-MoE CPU offload mode is enabled.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_cpu_offload_enabled = create_metric_per_engine(
+            gauge_moe_cpu_offload_enabled, per_engine_labelvalues
+        )
+
+        gauge_moe_gpu_limit_ratio = self._gauge_cls(
+            name="vllm:moe_gpu_limit_ratio",
+            documentation=(
+                "Configured GPU memory ratio for sparse-MoE CPU offload mode. "
+                "Falls back to gpu_memory_utilization when unset."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_gpu_limit_ratio = create_metric_per_engine(
+            gauge_moe_gpu_limit_ratio, per_engine_labelvalues
+        )
+
+        counter_moe_expert_delta_load_count = self._counter_cls(
+            name="vllm:moe_expert_delta_load_count",
+            documentation="Number of sparse-MoE expert delta loads from CPU.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_expert_delta_load_count = create_metric_per_engine(
+            counter_moe_expert_delta_load_count, per_engine_labelvalues
+        )
+
+        counter_moe_expert_delta_load_bytes = self._counter_cls(
+            name="vllm:moe_expert_delta_load_bytes",
+            documentation="Bytes transferred by sparse-MoE expert delta loads.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_expert_delta_load_bytes = create_metric_per_engine(
+            counter_moe_expert_delta_load_bytes, per_engine_labelvalues
+        )
+
+        histogram_moe_expert_load_latency_ms = self._histogram_cls(
+            name="vllm:moe_expert_load_latency_ms",
+            documentation="Sparse-MoE expert load latency in milliseconds.",
+            labelnames=labelnames,
+        )
+        self.histogram_moe_expert_load_latency_ms = create_metric_per_engine(
+            histogram_moe_expert_load_latency_ms, per_engine_labelvalues
+        )
+
+        gauge_moe_tokens_per_expert_load = self._gauge_cls(
+            name="vllm:moe_tokens_per_expert_load",
+            documentation="Average routed tokens served per expert delta load.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_tokens_per_expert_load = create_metric_per_engine(
+            gauge_moe_tokens_per_expert_load, per_engine_labelvalues
+        )
+
+        gauge_moe_bytes_loaded_per_token = self._gauge_cls(
+            name="vllm:moe_bytes_loaded_per_token",
+            documentation="Average expert-load bytes amortized per routed token.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_bytes_loaded_per_token = create_metric_per_engine(
+            gauge_moe_bytes_loaded_per_token, per_engine_labelvalues
+        )
+
+        gauge_moe_expert_reuse_before_eviction = self._gauge_cls(
+            name="vllm:moe_expert_reuse_before_eviction",
+            documentation="Average tokens served by an expert before eviction.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_expert_reuse_before_eviction = create_metric_per_engine(
+            gauge_moe_expert_reuse_before_eviction, per_engine_labelvalues
+        )
+
+        counter_moe_wave_count = self._counter_cls(
+            name="vllm:moe_wave_count",
+            documentation="Number of sparse-MoE utilization waves launched.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_wave_count = create_metric_per_engine(
+            counter_moe_wave_count, per_engine_labelvalues
+        )
+
+        histogram_moe_wave_token_count = self._histogram_cls(
+            name="vllm:moe_wave_token_count",
+            documentation="Routed token counts per sparse-MoE utilization wave.",
+            labelnames=labelnames,
+        )
+        self.histogram_moe_wave_token_count = create_metric_per_engine(
+            histogram_moe_wave_token_count, per_engine_labelvalues
+        )
+
+        histogram_moe_wave_queue_wait_ms = self._histogram_cls(
+            name="vllm:moe_wave_queue_wait_ms",
+            documentation="Queue wait in milliseconds before a sparse-MoE wave launches.",
+            labelnames=labelnames,
+        )
+        self.histogram_moe_wave_queue_wait_ms = create_metric_per_engine(
+            histogram_moe_wave_queue_wait_ms, per_engine_labelvalues
+        )
+
+        gauge_moe_wave_compute_estimate_ms = self._gauge_cls(
+            name="vllm:moe_wave_compute_estimate_ms",
+            documentation="Estimated compute time for the current sparse-MoE wave.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_wave_compute_estimate_ms = create_metric_per_engine(
+            gauge_moe_wave_compute_estimate_ms, per_engine_labelvalues
+        )
+
+        gauge_moe_wave_transfer_estimate_ms = self._gauge_cls(
+            name="vllm:moe_wave_transfer_estimate_ms",
+            documentation="Estimated transfer time for the next sparse-MoE expert delta.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_wave_transfer_estimate_ms = create_metric_per_engine(
+            gauge_moe_wave_transfer_estimate_ms, per_engine_labelvalues
+        )
+
+        gauge_moe_wave_projected_gpu_bytes = self._gauge_cls(
+            name="vllm:moe_wave_projected_gpu_bytes",
+            documentation="Projected GPU bytes for the current sparse-MoE wave.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_wave_projected_gpu_bytes = create_metric_per_engine(
+            gauge_moe_wave_projected_gpu_bytes, per_engine_labelvalues
+        )
+
+        gauge_moe_wave_kv_bytes = self._gauge_cls(
+            name="vllm:moe_wave_kv_bytes",
+            documentation="Projected KV-cache bytes attributed to the current sparse-MoE wave.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_wave_kv_bytes = create_metric_per_engine(
+            gauge_moe_wave_kv_bytes, per_engine_labelvalues
+        )
+
+        gauge_moe_wave_token_buffer_bytes = self._gauge_cls(
+            name="vllm:moe_wave_token_buffer_bytes",
+            documentation="Projected token-buffer bytes for the current sparse-MoE wave.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_wave_token_buffer_bytes = create_metric_per_engine(
+            gauge_moe_wave_token_buffer_bytes, per_engine_labelvalues
+        )
+
+        gauge_moe_active_expert_count = self._gauge_cls(
+            name="vllm:moe_active_expert_count",
+            documentation="Number of active sparse-MoE experts resident for execution.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_active_expert_count = create_metric_per_engine(
+            gauge_moe_active_expert_count, per_engine_labelvalues
+        )
+
+        gauge_moe_fallback_expert_count = self._gauge_cls(
+            name="vllm:moe_fallback_expert_count",
+            documentation="Number of sparse-MoE fallback experts resident on GPU.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_fallback_expert_count = create_metric_per_engine(
+            gauge_moe_fallback_expert_count, per_engine_labelvalues
+        )
+
+        gauge_moe_resident_expert_bytes = self._gauge_cls(
+            name="vllm:moe_resident_expert_bytes",
+            documentation="Bytes consumed by GPU-resident sparse-MoE expert weights.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_resident_expert_bytes = create_metric_per_engine(
+            gauge_moe_resident_expert_bytes, per_engine_labelvalues
+        )
+
+        gauge_moe_expert_cache_hit_ratio = self._gauge_cls(
+            name="vllm:moe_expert_cache_hit_ratio",
+            documentation="Ratio of required sparse-MoE active experts already resident on GPU.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_expert_cache_hit_ratio = create_metric_per_engine(
+            gauge_moe_expert_cache_hit_ratio, per_engine_labelvalues
+        )
+
+        counter_moe_cold_expert_eviction_count = self._counter_cls(
+            name="vllm:moe_cold_expert_eviction_count",
+            documentation="Number of cold sparse-MoE expert evictions from GPU residency.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_cold_expert_eviction_count = create_metric_per_engine(
+            counter_moe_cold_expert_eviction_count, per_engine_labelvalues
+        )
+
+        counter_moe_group_fallback_count = self._counter_cls(
+            name="vllm:moe_group_fallback_count",
+            documentation="Number of same-group sparse-MoE fallback executions.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_group_fallback_count = create_metric_per_engine(
+            counter_moe_group_fallback_count, per_engine_labelvalues
+        )
+
+        gauge_moe_group_fallback_ratio = self._gauge_cls(
+            name="vllm:moe_group_fallback_ratio",
+            documentation="Ratio of exact misses served by same-group sparse-MoE fallback.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_moe_group_fallback_ratio = create_metric_per_engine(
+            gauge_moe_group_fallback_ratio, per_engine_labelvalues
+        )
+
+        counter_moe_group_fallback_exact_miss_count = self._counter_cls(
+            name="vllm:moe_group_fallback_exact_miss_count",
+            documentation="Number of exact sparse-MoE expert misses considered for fallback.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_group_fallback_exact_miss_count = create_metric_per_engine(
+            counter_moe_group_fallback_exact_miss_count, per_engine_labelvalues
+        )
+
+        counter_moe_group_fallback_threshold_reject_count = self._counter_cls(
+            name="vllm:moe_group_fallback_threshold_reject_count",
+            documentation="Number of same-group sparse-MoE fallbacks rejected by threshold.",
+            labelnames=labelnames,
+        )
+        self.counter_moe_group_fallback_threshold_reject_count = create_metric_per_engine(
+            counter_moe_group_fallback_threshold_reject_count, per_engine_labelvalues
+        )
+
+        enabled = 1 if vllm_config.moe_offload_config.enabled else 0
+        gpu_limit_ratio = vllm_config.moe_offload_config.effective_gpu_limit(
+            vllm_config.cache_config.gpu_memory_utilization
+        )
+        for engine_idx in self.engine_indexes:
+            self.gauge_moe_cpu_offload_enabled[engine_idx].set(enabled)
+            self.gauge_moe_gpu_limit_ratio[engine_idx].set(gpu_limit_ratio)
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
@@ -1039,6 +1291,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if type == "cache_config":
             name = "vllm:cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+        elif type == "moe_offload_config":
+            name = "vllm:moe_offload_config_info"
+            documentation = "Information of the LLMEngine MoE offload config"
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1103,6 +1358,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if scheduler_stats.kv_connector_stats is not None:
                 self.kv_connector_prom.observe(
                     scheduler_stats.kv_connector_stats, engine_idx
+                )
+
+            if scheduler_stats.moe_offload_stats is not None:
+                self._observe_moe_offload_stats(
+                    scheduler_stats.moe_offload_stats, engine_idx
                 )
 
             if scheduler_stats.perf_stats is not None:
@@ -1236,6 +1496,86 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
     def log_engine_initialized(self):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        self.log_metrics_info(
+            "moe_offload_config",
+            self.vllm_config.moe_offload_config,
+        )
+
+    def _observe_moe_offload_stats(
+        self, moe_stats: MoEOffloadStats, engine_idx: int
+    ) -> None:
+        self.counter_moe_expert_delta_load_count[engine_idx].inc(
+            moe_stats.expert_delta_load_count
+        )
+        self.counter_moe_expert_delta_load_bytes[engine_idx].inc(
+            moe_stats.expert_delta_load_bytes
+        )
+        if moe_stats.expert_load_latency_ms > 0:
+            self.histogram_moe_expert_load_latency_ms[engine_idx].observe(
+                moe_stats.expert_load_latency_ms
+            )
+
+        self.gauge_moe_tokens_per_expert_load[engine_idx].set(
+            moe_stats.tokens_per_expert_load
+        )
+        self.gauge_moe_bytes_loaded_per_token[engine_idx].set(
+            moe_stats.bytes_loaded_per_token
+        )
+        self.gauge_moe_expert_reuse_before_eviction[engine_idx].set(
+            moe_stats.expert_reuse_before_eviction
+        )
+
+        self.counter_moe_wave_count[engine_idx].inc(moe_stats.wave_count)
+        if moe_stats.wave_token_count > 0:
+            self.histogram_moe_wave_token_count[engine_idx].observe(
+                moe_stats.wave_token_count
+            )
+        if moe_stats.wave_queue_wait_ms > 0:
+            self.histogram_moe_wave_queue_wait_ms[engine_idx].observe(
+                moe_stats.wave_queue_wait_ms
+            )
+        self.gauge_moe_wave_compute_estimate_ms[engine_idx].set(
+            moe_stats.wave_compute_estimate_ms
+        )
+        self.gauge_moe_wave_transfer_estimate_ms[engine_idx].set(
+            moe_stats.wave_transfer_estimate_ms
+        )
+        self.gauge_moe_wave_projected_gpu_bytes[engine_idx].set(
+            moe_stats.wave_projected_gpu_bytes
+        )
+        self.gauge_moe_wave_kv_bytes[engine_idx].set(moe_stats.wave_kv_bytes)
+        self.gauge_moe_wave_token_buffer_bytes[engine_idx].set(
+            moe_stats.wave_token_buffer_bytes
+        )
+
+        self.gauge_moe_active_expert_count[engine_idx].set(
+            moe_stats.active_expert_count
+        )
+        self.gauge_moe_fallback_expert_count[engine_idx].set(
+            moe_stats.fallback_expert_count
+        )
+        self.gauge_moe_resident_expert_bytes[engine_idx].set(
+            moe_stats.resident_expert_bytes
+        )
+        self.gauge_moe_expert_cache_hit_ratio[engine_idx].set(
+            moe_stats.expert_cache_hit_ratio
+        )
+        self.counter_moe_cold_expert_eviction_count[engine_idx].inc(
+            moe_stats.cold_expert_eviction_count
+        )
+
+        self.counter_moe_group_fallback_count[engine_idx].inc(
+            moe_stats.group_fallback_count
+        )
+        self.gauge_moe_group_fallback_ratio[engine_idx].set(
+            moe_stats.group_fallback_ratio
+        )
+        self.counter_moe_group_fallback_exact_miss_count[engine_idx].inc(
+            moe_stats.group_fallback_exact_miss_count
+        )
+        self.counter_moe_group_fallback_threshold_reject_count[engine_idx].inc(
+            moe_stats.group_fallback_threshold_reject_count
+        )
 
 
 def build_buckets(mantissa_lst: list[int], max_value: int) -> list[int]:

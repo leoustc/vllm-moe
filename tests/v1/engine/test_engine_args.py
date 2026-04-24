@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from argparse import ArgumentError
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from vllm.config import VllmConfig
+from vllm.config import MoEOffloadConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -90,3 +93,77 @@ def test_defaults_with_usage_context():
     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_moe_offload_cli_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--moe-cpu-offload",
+            "--moe-gpu-limit",
+            "0.5",
+            "--moe-wave-min-tokens",
+            "4096",
+            "--moe-min-residency-steps",
+            "7",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.moe_cpu_offload
+    assert engine_args.moe_gpu_limit == 0.5
+    assert engine_args.moe_wave_min_tokens == 4096
+    assert engine_args.moe_min_residency_steps == 7
+
+
+def test_moe_offload_config_requires_enablement():
+    with pytest.raises(
+        ValidationError,
+        match="moe_gpu_limit requires moe_cpu_offload",
+    ):
+        MoEOffloadConfig(gpu_limit=0.5)
+
+
+def test_moe_offload_batch_defaults_raise_wave_target():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        moe_cpu_offload=True,
+        moe_wave_min_tokens=4096,
+    )
+    engine_args.max_num_batched_tokens = None
+    engine_args.max_num_seqs = 32
+    engine_args.enable_chunked_prefill = True
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        usage_context=UsageContext.OPENAI_API_SERVER,
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(use_batched_dp_moe=False),
+    )
+
+    assert engine_args.max_num_batched_tokens == 4096
+
+
+def test_moe_offload_preserves_explicit_batch_limit():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        moe_cpu_offload=True,
+        moe_wave_min_tokens=4096,
+        max_num_batched_tokens=1024,
+        max_num_seqs=32,
+        enable_chunked_prefill=True,
+    )
+
+    engine_args._set_default_max_num_seqs_and_batched_tokens_args(
+        usage_context=UsageContext.OPENAI_API_SERVER,
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(use_batched_dp_moe=False),
+    )
+
+    assert engine_args.max_num_batched_tokens == 1024
+
+
+def test_moe_offload_config_validates_active_budget_requires_enablement():
+    with pytest.raises(
+        ValidationError,
+        match="moe_active_expert_budget requires moe_cpu_offload",
+    ):
+        MoEOffloadConfig(active_expert_budget=8)

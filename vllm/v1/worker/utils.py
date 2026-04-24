@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
@@ -400,22 +400,34 @@ def sanity_check_mm_encoder_outputs(
     )
 
 
-def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:
+def request_memory(init_snapshot: MemorySnapshot, vllm_config: VllmConfig) -> int:
     """
     Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
     """
+    cache_config = vllm_config.cache_config
+    moe_offload_config = vllm_config.moe_offload_config
+    gpu_limit = moe_offload_config.effective_gpu_limit(
+        cache_config.gpu_memory_utilization
+    )
     requested_memory = math.ceil(
-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
+        init_snapshot.total_memory * gpu_limit
     )
 
     if init_snapshot.free_memory < requested_memory:
+        limit_name = (
+            "moe_gpu_limit"
+            if moe_offload_config.enabled
+            and moe_offload_config.gpu_limit is not None
+            and gpu_limit == moe_offload_config.gpu_limit
+            else "gpu_memory_utilization"
+        )
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"
             f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
             f"is less than desired GPU memory utilization "
-            f"({cache_config.gpu_memory_utilization}, "
+            f"({limit_name}={gpu_limit}, "
             f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
             f"utilization or reduce GPU memory used by other processes."
         )

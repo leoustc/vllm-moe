@@ -46,6 +46,7 @@ from vllm.config import (
     LoadConfig,
     LoRAConfig,
     MambaConfig,
+    MoEOffloadConfig,
     ModelConfig,
     MultiModalConfig,
     ObservabilityConfig,
@@ -501,6 +502,21 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    moe_cpu_offload: bool = MoEOffloadConfig.enabled
+    moe_gpu_limit: float | None = MoEOffloadConfig.gpu_limit
+    moe_active_expert_budget: int | None = MoEOffloadConfig.active_expert_budget
+    moe_fallback_expert_budget: int | None = (
+        MoEOffloadConfig.fallback_expert_budget
+    )
+    moe_wave_min_tokens: int = MoEOffloadConfig.wave_min_tokens
+    moe_wave_max_wait_ms: int = MoEOffloadConfig.wave_max_wait_ms
+    moe_transfer_safety_factor: float = MoEOffloadConfig.transfer_safety_factor
+    moe_group_fallback: bool = MoEOffloadConfig.group_fallback
+    moe_group_fallback_threshold: float = (
+        MoEOffloadConfig.group_fallback_threshold
+    )
+    moe_resident_first: bool = MoEOffloadConfig.resident_first
+    moe_min_residency_steps: int = MoEOffloadConfig.min_residency_steps
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -1107,6 +1123,44 @@ class EngineArgs:
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
 
+        moe_kwargs = get_kwargs(MoEOffloadConfig)
+        moe_group = parser.add_argument_group(
+            title="MoEOffloadConfig",
+            description=MoEOffloadConfig.__doc__,
+        )
+        moe_group.add_argument("--moe-cpu-offload", **moe_kwargs["enabled"])
+        moe_group.add_argument("--moe-gpu-limit", **moe_kwargs["gpu_limit"])
+        moe_group.add_argument(
+            "--moe-active-expert-budget", **moe_kwargs["active_expert_budget"]
+        )
+        moe_group.add_argument(
+            "--moe-fallback-expert-budget",
+            **moe_kwargs["fallback_expert_budget"],
+        )
+        moe_group.add_argument(
+            "--moe-wave-min-tokens", **moe_kwargs["wave_min_tokens"]
+        )
+        moe_group.add_argument(
+            "--moe-wave-max-wait-ms", **moe_kwargs["wave_max_wait_ms"]
+        )
+        moe_group.add_argument(
+            "--moe-transfer-safety-factor",
+            **moe_kwargs["transfer_safety_factor"],
+        )
+        moe_group.add_argument(
+            "--moe-group-fallback", **moe_kwargs["group_fallback"]
+        )
+        moe_group.add_argument(
+            "--moe-group-fallback-threshold",
+            **moe_kwargs["group_fallback_threshold"],
+        )
+        moe_group.add_argument(
+            "--moe-resident-first", **moe_kwargs["resident_first"]
+        )
+        moe_group.add_argument(
+            "--moe-min-residency-steps", **moe_kwargs["min_residency_steps"]
+        )
+
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
@@ -1629,6 +1683,11 @@ class EngineArgs:
         self.model_weights = model_config.model_weights
         self.tokenizer = model_config.tokenizer
 
+        if self.moe_cpu_offload and not model_config.is_moe:
+            raise ValueError(
+                "moe_cpu_offload is only supported for sparse-MoE models."
+            )
+
         self._check_feature_supported()
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()
@@ -2114,6 +2173,19 @@ class EngineArgs:
                 offload_params=self.offload_params,
             ),
         )
+        moe_offload_config = MoEOffloadConfig(
+            enabled=self.moe_cpu_offload,
+            gpu_limit=self.moe_gpu_limit,
+            active_expert_budget=self.moe_active_expert_budget,
+            fallback_expert_budget=self.moe_fallback_expert_budget,
+            wave_min_tokens=self.moe_wave_min_tokens,
+            wave_max_wait_ms=self.moe_wave_max_wait_ms,
+            transfer_safety_factor=self.moe_transfer_safety_factor,
+            group_fallback=self.moe_group_fallback,
+            group_fallback_threshold=self.moe_group_fallback_threshold,
+            resident_first=self.moe_resident_first,
+            min_residency_steps=self.moe_min_residency_steps,
+        )
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
@@ -2126,6 +2198,7 @@ class EngineArgs:
             device_config=device_config,
             load_config=load_config,
             offload_config=offload_config,
+            moe_offload_config=moe_offload_config,
             attention_config=attention_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
@@ -2376,6 +2449,23 @@ class EngineArgs:
                 self.max_num_seqs *= 2
 
         if orig_max_num_batched_tokens is None:
+            moe_offload_config = MoEOffloadConfig(
+                enabled=self.moe_cpu_offload,
+                gpu_limit=self.moe_gpu_limit,
+                active_expert_budget=self.moe_active_expert_budget,
+                fallback_expert_budget=self.moe_fallback_expert_budget,
+                wave_min_tokens=self.moe_wave_min_tokens,
+                wave_max_wait_ms=self.moe_wave_max_wait_ms,
+                transfer_safety_factor=self.moe_transfer_safety_factor,
+                group_fallback=self.moe_group_fallback,
+                group_fallback_threshold=self.moe_group_fallback_threshold,
+                resident_first=self.moe_resident_first,
+                min_residency_steps=self.moe_min_residency_steps,
+            )
+            if moe_offload_config.enabled:
+                self.max_num_batched_tokens = moe_offload_config.effective_wave_target(
+                    self.max_num_batched_tokens
+                )
             assert model_config.max_model_len is not None, (
                 "max_model_len must be set by this point"
             )
@@ -2393,6 +2483,14 @@ class EngineArgs:
                 self.max_num_seqs * model_config.max_model_len,
                 self.max_num_batched_tokens,
             )
+
+            if moe_offload_config.enabled:
+                logger.info(
+                    "MoE CPU offload enabled; targeting token waves up to "
+                    "max_num_batched_tokens=%d (wave_min_tokens=%d).",
+                    self.max_num_batched_tokens,
+                    moe_offload_config.wave_min_tokens,
+                )
 
             logger.debug(
                 "Defaulting max_num_batched_tokens to %d for %s usage context.",

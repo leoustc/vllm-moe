@@ -111,6 +111,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.compilation_config = vllm_config.compilation_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
+        self.moe_offload_config = vllm_config.moe_offload_config
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
@@ -176,6 +177,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
                     raise ValueError("EAGLE3 with pipeline parallel is not supported.")
+
+        if self.moe_offload_config.enabled:
+            logger.info(
+                "MoE CPU offload mode enabled "
+                "(gpu_limit=%s, wave_min_tokens=%d, group_fallback=%s).",
+                self.moe_offload_config.gpu_limit,
+                self.moe_offload_config.wave_min_tokens,
+                self.moe_offload_config.group_fallback,
+            )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)

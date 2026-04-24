@@ -403,6 +403,7 @@ class GPUModelRunner(
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
+        self.moe_offload_config = vllm_config.moe_offload_config
         self.compilation_config = vllm_config.compilation_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -460,6 +461,15 @@ class GPUModelRunner(
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+
+        if self.moe_offload_config.enabled:
+            logger.info(
+                "MoE CPU offload mode enabled "
+                "(gpu_limit=%s, wave_min_tokens=%d, group_fallback=%s).",
+                self.moe_offload_config.gpu_limit,
+                self.moe_offload_config.wave_min_tokens,
+                self.moe_offload_config.group_fallback,
+            )
 
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
