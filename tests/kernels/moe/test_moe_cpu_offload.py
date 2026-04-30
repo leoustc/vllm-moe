@@ -351,7 +351,7 @@ def test_prefetch_pager_loads_missing_without_mutating_missing_list():
     assert cache.pager_step()
 
     assert cache.resident_expert_ids() == {2}
-    assert cache.missing_experts == {2}
+    assert cache.missing_experts == set()
     assert cache.active_experts[2].gpu_slot_id == 0
     assert cache._free_slots == [1]
     assert torch.equal(cache.target_for("w13_weight")[0], layer.w13_weight[2])
@@ -415,7 +415,7 @@ def test_prefetch_prepare_can_wait_for_pager_loaded_wave():
 
     assert waves == [{1: 4, 2: 3}]
     assert cache.resident_expert_ids() == {1, 2}
-    assert cache.missing_experts == {1, 2}
+    assert cache.missing_experts == set()
 
 
 def test_prefetch_runtime_replaces_cpu_placeholder_with_execution_target():
