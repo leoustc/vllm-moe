@@ -7,6 +7,9 @@ This branch adds two independent MoE offload execution modes to vLLM:
 --moe-gpu-prefetch <num>
 ```
 
+> ## Run 26B MoE model on 40GB GPU, with output token throughput: **55.32** tok/s
+
+
 The original upstream vLLM README is preserved at [README.old](README.old).
 
 ![MoE CPU offload overview](moe-cpu-offload.png)
@@ -93,6 +96,43 @@ Summary:
 
 This mode uses a bounded GPU expert cache to improve reuse when routed experts
 repeat across requests.
+
+### Case 2 Short Benchmark
+
+Run:
+
+```bash
+make -C dev/moe test-case2 TEST_CASE_GPU=4
+```
+
+Benchmark parameters:
+
+```make
+TEST_CASE2_PREFETCH ?= 64
+TEST_CASE2_BENCH_NUM_PROMPTS ?= 16
+TEST_CASE2_BENCH_REQUEST_RATE ?= 8
+TEST_CASE2_BENCH_CONCURRENCY ?= 16
+TEST_CASE_BENCH_INPUT_LEN ?= 64
+TEST_CASE_BENCH_OUTPUT_LEN ?= 64
+```
+
+Latest single-GPU result with `/models/gemma-4-26B-A4B-it` and
+`--moe-gpu-prefetch 64`:
+
+```text
+Successful requests: 16
+Failed requests: 0
+Benchmark duration: 18.51s
+Output token throughput: 55.32 tok/s
+Total token throughput: 122.09 tok/s
+Mean TTFT: 2200.84 ms
+Mean TPOT: 240.59 ms
+```
+
+The earlier short default (`8` prompts, `2` RPS, concurrency `8`) measured about
+`30.27 tok/s` output throughput. Raising Case 2 request pressure to `16` prompts,
+`8` RPS, and concurrency `16` measured about `55.32 tok/s` while keeping the run
+short.
 
 ## Example Validation
 

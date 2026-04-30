@@ -170,6 +170,11 @@ Recent implementation note:
 - `make test-case` is now a short single-GPU throughput comparison. It runs Case
   1 and Case 2 sequentially on `TEST_CASE_GPU`, uses 8 benchmark prompts by
   default, and keeps the benchmark workload at 64 input / 64 output tokens.
+- `make test-case2` uses a higher-pressure short benchmark by default:
+  `TEST_CASE2_BENCH_NUM_PROMPTS=16`, `TEST_CASE2_BENCH_REQUEST_RATE=8`, and
+  `TEST_CASE2_BENCH_CONCURRENCY=16`. This improved the observed Case 2 output
+  throughput from about `30 tok/s` to about `55 tok/s` on the same single-GPU
+  setup while keeping the benchmark short.
 
 ## Known Limitations
 
