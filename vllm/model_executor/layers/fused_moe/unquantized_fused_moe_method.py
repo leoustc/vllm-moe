@@ -23,8 +23,11 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
+from vllm.model_executor.layers.fused_moe.moe_gpu_prefetch import (
+    local_expert_token_counts as prefetch_local_expert_token_counts,
+)
 from vllm.model_executor.layers.fused_moe.moe_offload import (
-    local_expert_token_counts,
+    local_expert_token_counts as passive_local_expert_token_counts,
 )
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
@@ -342,85 +345,81 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     "MoE CPU offload does not yet support internally "
                     "overlapped shared experts."
                 )
-            token_counts = local_expert_token_counts(
+            if layer.moe_gpu_prefetch_enabled:
+                token_counts = prefetch_local_expert_token_counts(
+                    topk_ids,
+                    local_num_experts=layer.local_num_experts,
+                    expert_map=layer.expert_map,
+                )
+                if not token_counts:
+                    return torch.zeros_like(x)
+                layer.move_moe_offload_cache_to_device(x.device)
+                output: torch.Tensor | None = None
+                resident_waves, missing_waves = (
+                    layer.moe_offload_cache.prepare_prefetch_batch(token_counts)
+                )
+
+                def run_prefetch_waves(
+                    waves: list[dict[int, int]],
+                    *,
+                    wait_for_prefetch: bool,
+                ) -> None:
+                    nonlocal output
+                    for expert_counts in waves:
+                        wave_experts = set(expert_counts)
+                        try:
+                            if wait_for_prefetch:
+                                layer.moe_offload_cache.wait_for_prefetch_experts(
+                                    wave_experts
+                                )
+                            layer.moe_offload_cache.wait_for_experts_ready(
+                                wave_experts
+                            )
+                            wave_topk_ids, wave_topk_weights = (
+                                layer.moe_offload_cache.make_wave_tensors(
+                                    topk_ids,
+                                    topk_weights,
+                                    local_expert_ids=wave_experts,
+                                    expert_map=layer.expert_map,
+                                )
+                            )
+                            staged_num_experts = int(layer.w13_weight.shape[0])
+                            wave_output = self.moe_kernel.apply(
+                                hidden_states=x,
+                                w1=layer.w13_weight,
+                                w2=layer.w2_weight,
+                                topk_weights=wave_topk_weights,
+                                topk_ids=wave_topk_ids,
+                                activation=layer.activation,
+                                apply_router_weight_on_input=(
+                                    layer.apply_router_weight_on_input
+                                ),
+                                global_num_experts=staged_num_experts,
+                                expert_map=None,
+                                shared_experts_input=None,
+                            )
+                            output = (
+                                wave_output
+                                if output is None
+                                else output + wave_output
+                            )
+                        finally:
+                            layer.moe_offload_cache.finish_prefetch_request(
+                                wave_experts
+                            )
+
+                run_prefetch_waves(resident_waves, wait_for_prefetch=False)
+                if missing_waves:
+                    run_prefetch_waves(missing_waves, wait_for_prefetch=True)
+                return output if output is not None else torch.zeros_like(x)
+
+            token_counts = passive_local_expert_token_counts(
                 topk_ids,
                 local_num_experts=layer.local_num_experts,
                 expert_map=layer.expert_map,
             )
             if not token_counts:
                 return torch.zeros_like(x)
-            if layer.moe_gpu_prefetch_enabled:
-                layer.move_moe_offload_cache_to_device(x.device)
-                output: torch.Tensor | None = None
-                desired_batches = layer.moe_offload_cache.expert_batches_for_counts(
-                    token_counts
-                )
-                for desired_counts in desired_batches:
-                    pending_counts = dict(desired_counts)
-
-                    def run_prefetch_waves(
-                        waves: list[dict[int, int]],
-                        pending_expert_counts: dict[int, int],
-                    ) -> None:
-                        nonlocal output
-                        for expert_counts in waves:
-                            wave_experts = set(expert_counts)
-                            try:
-                                layer.moe_offload_cache.wait_for_experts_ready(
-                                    wave_experts
-                                )
-                                wave_topk_ids, wave_topk_weights = (
-                                    layer.moe_offload_cache.make_wave_tensors(
-                                        topk_ids,
-                                        topk_weights,
-                                        local_expert_ids=wave_experts,
-                                        expert_map=layer.expert_map,
-                                    )
-                                )
-                                staged_num_experts = int(layer.w13_weight.shape[0])
-                                wave_output = self.moe_kernel.apply(
-                                    hidden_states=x,
-                                    w1=layer.w13_weight,
-                                    w2=layer.w2_weight,
-                                    topk_weights=wave_topk_weights,
-                                    topk_ids=wave_topk_ids,
-                                    activation=layer.activation,
-                                    apply_router_weight_on_input=(
-                                        layer.apply_router_weight_on_input
-                                    ),
-                                    global_num_experts=staged_num_experts,
-                                    expert_map=None,
-                                    shared_experts_input=None,
-                                )
-                                output = (
-                                    wave_output
-                                    if output is None
-                                    else output + wave_output
-                                )
-                                for expert_id in wave_experts:
-                                    pending_expert_counts.pop(expert_id, None)
-                            finally:
-                                layer.moe_offload_cache.finish_prefetch_request(
-                                    wave_experts
-                                )
-
-                    resident_waves = (
-                        layer.moe_offload_cache.prepare_prefetch_request(
-                            pending_counts,
-                            wait_for_resident=False,
-                        )
-                    )
-                    run_prefetch_waves(resident_waves, pending_counts)
-                    if pending_counts:
-                        missing_waves = (
-                            layer.moe_offload_cache.prepare_prefetch_request(
-                                pending_counts,
-                                wait_for_resident=True,
-                            )
-                        )
-                        run_prefetch_waves(missing_waves, pending_counts)
-                return output if output is not None else torch.zeros_like(x)
-
             output: torch.Tensor | None = None
             expert_batches = layer.moe_offload_cache.expert_batches_for_counts(
                 token_counts
