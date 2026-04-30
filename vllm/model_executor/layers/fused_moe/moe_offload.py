@@ -33,6 +33,7 @@ class ActiveExpertEntry:
     loaded_step: int
     last_used_step: int
     recent_token_count: int
+    ready_event: torch.cuda.Event | None = None
 
 
 @dataclass
@@ -91,6 +92,9 @@ class ExpertCache:
         self._pager_condition = Condition(self._pager_lock)
         self._pager_stop = Event()
         self._pager_thread: Thread | None = None
+        self._copy_stream: torch.cuda.Stream | None = None
+        self._copy_stream_device: torch.device | None = None
+        self._slot_safe_events: dict[int, torch.cuda.Event] = {}
 
     @classmethod
     def from_layer(
@@ -246,6 +250,7 @@ class ExpertCache:
         self._target_device = device
         self._free_slots = list(range(self._slot_count))
         self.active_experts.clear()
+        self._slot_safe_events.clear()
 
     def release_targets_to_cpu(self) -> None:
         if self.use_identity_slots:
@@ -259,19 +264,86 @@ class ExpertCache:
             )
         self._free_slots = list(range(self._slot_count))
         self.active_experts.clear()
+        self._slot_safe_events.clear()
         with self._pager_lock:
             self.working_experts.clear()
             self.missing_experts.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _load_expert(self, expert_id: int, slot_id: int) -> None:
+    def _copy_stream_for(
+        self,
+        device: torch.device,
+    ) -> torch.cuda.Stream | None:
+        if device.type != "cuda":
+            return None
+        if self._copy_stream is None or self._copy_stream_device != device:
+            with torch.cuda.device(device):
+                self._copy_stream = torch.cuda.Stream(device=device)
+            self._copy_stream_device = device
+        return self._copy_stream
+
+    def _load_expert(
+        self,
+        expert_id: int,
+        slot_id: int,
+    ) -> torch.cuda.Event | None:
         self.ensure_targets_on_device(self._target_device)
-        self._wait_for_gpu_memory(expert_id, self.expert_tensors[0].target.device)
-        for expert_tensor in self.expert_tensors:
-            source = expert_tensor.source[expert_id]
-            target = expert_tensor.target[slot_id]
-            target.copy_(source, non_blocking=True)
+        device = self.expert_tensors[0].target.device
+        self._wait_for_gpu_memory(expert_id, device)
+        copy_stream = self._copy_stream_for(device)
+        if copy_stream is None:
+            for expert_tensor in self.expert_tensors:
+                source = expert_tensor.source[expert_id]
+                target = expert_tensor.target[slot_id]
+                target.copy_(source, non_blocking=True)
+            return None
+
+        with torch.cuda.device(device), torch.cuda.stream(copy_stream):
+            slot_safe_event = self._slot_safe_events.pop(slot_id, None)
+            if slot_safe_event is not None:
+                copy_stream.wait_event(slot_safe_event)
+            for expert_tensor in self.expert_tensors:
+                source = expert_tensor.source[expert_id]
+                target = expert_tensor.target[slot_id]
+                target.copy_(source, non_blocking=True)
+            ready_event = torch.cuda.Event()
+            ready_event.record(copy_stream)
+        return ready_event
+
+    def _wait_for_copy_event(self, event: torch.cuda.Event | None) -> None:
+        if event is None:
+            return
+        event.synchronize()
+
+    def wait_for_experts_ready(self, expert_ids: set[int]) -> None:
+        if self._target_device.type != "cuda":
+            return
+        stream = torch.cuda.current_stream(self._target_device)
+        for expert_id in expert_ids:
+            entry = self.active_experts.get(expert_id)
+            if entry is None:
+                raise RuntimeError(
+                    f"Expert {expert_id} is not resident in the MoE offload cache"
+                )
+            if entry.ready_event is not None:
+                stream.wait_event(entry.ready_event)
+            entry.state = "executing"
+
+    def mark_experts_available(self, expert_ids: set[int]) -> None:
+        if not expert_ids:
+            return
+        use_event: torch.cuda.Event | None = None
+        if self._target_device.type == "cuda":
+            use_event = torch.cuda.Event()
+            use_event.record(torch.cuda.current_stream(self._target_device))
+        for expert_id in expert_ids:
+            entry = self.active_experts.get(expert_id)
+            if entry is None:
+                continue
+            entry.state = "resident"
+            if use_event is not None:
+                self._slot_safe_events[entry.gpu_slot_id] = use_event
 
     def _allocate_slot(self, expert_id: int) -> int:
         if self.use_identity_slots:
@@ -454,7 +526,8 @@ class ExpertCache:
             entry = self.active_experts.get(expert_id)
             if entry is None:
                 slot_id = self._allocate_slot(expert_id)
-                self._load_expert(expert_id, slot_id)
+                ready_event = self._load_expert(expert_id, slot_id)
+                self._wait_for_copy_event(ready_event)
                 entry = ActiveExpertEntry(
                     layer_id=self.layer_id,
                     expert_id=expert_id,
@@ -464,6 +537,7 @@ class ExpertCache:
                     loaded_step=self.step,
                     last_used_step=self.step,
                     recent_token_count=token_count,
+                    ready_event=None,
                 )
                 self.active_experts[expert_id] = entry
             else:
@@ -533,6 +607,7 @@ class ExpertCache:
             while wait_for_resident and missing_experts:
                 self._pager_condition.wait(timeout=PAGER_MAIN_WAIT_SECONDS)
                 missing_experts = requested_experts - set(self.active_experts)
+                self.missing_experts = set(missing_experts)
             resident_counts = {
                 expert_id: token_count
                 for expert_id, token_count in expert_token_counts.items()
@@ -555,6 +630,7 @@ class ExpertCache:
         if self.mode != "prefetch" or self.use_identity_slots:
             return
         with self._pager_condition:
+            self.mark_experts_available(expert_ids)
             self.working_experts.difference_update(expert_ids)
             self._log_pager_state(
                 event="summary",
@@ -589,7 +665,7 @@ class ExpertCache:
             slot_id, _victim_id = reserved
 
         try:
-            self._load_expert(expert_id, slot_id)
+            ready_event = self._load_expert(expert_id, slot_id)
         except Exception:
             with self._pager_condition:
                 if slot_id not in self._free_slots:
@@ -608,7 +684,9 @@ class ExpertCache:
                 loaded_step=self.step,
                 last_used_step=self.step,
                 recent_token_count=0,
+                ready_event=ready_event,
             )
+            self.missing_experts.discard(expert_id)
             self._log_pager_state(
                 event="load",
                 working_experts=self.working_experts,
