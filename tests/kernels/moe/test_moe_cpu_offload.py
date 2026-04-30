@@ -3,6 +3,9 @@
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.moe_gpu_prefetch import (
+    MoeGpuPrefetchExpertCache,
+)
 from vllm.model_executor.layers.fused_moe.moe_offload import (
     ExpertCache,
     local_expert_token_counts,
@@ -111,7 +114,6 @@ def test_expert_cache_stages_cpu_sources_and_remaps_topk_ids():
             "w2_weight": layer.w2_weight.detach(),
         },
         device=torch.device("cpu"),
-        mode="passive",
     )
 
     topk_ids = torch.tensor([[2, 1], [2, 1]])
@@ -136,7 +138,6 @@ def test_passive_cache_logs_transfer_not_pager(monkeypatch):
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
     log_messages = []
     monkeypatch.setattr(
@@ -160,7 +161,6 @@ def test_expert_cache_rejects_more_demand_than_staging_budget():
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
 
     topk_ids = torch.tensor([[0, 1], [2, 1]])
@@ -184,7 +184,6 @@ def test_expert_cache_builds_budget_sized_waves():
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
     counts = {0: 1, 1: 4, 2: 3, 3: 2}
 
@@ -200,7 +199,6 @@ def test_expert_cache_auto_budget_uses_smaller_gpu_memory_wave(monkeypatch):
         active_expert_budget=None,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cuda"),
-        mode="passive",
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (50, 100))
@@ -221,7 +219,6 @@ def test_expert_cache_auto_budget_does_not_allocate_before_wave_sizing(
         active_expert_budget=None,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cuda"),
-        mode="passive",
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (50, 100))
@@ -241,7 +238,6 @@ def test_expert_cache_wave_tensors_mask_nonresident_experts():
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
     topk_ids = torch.tensor([[1, 2], [3, 0]])
     topk_weights = torch.tensor([[0.4, 0.6], [0.25, 0.75]])
@@ -265,7 +261,6 @@ def test_expert_cache_keeps_requested_wave_resident_when_reusing_slots():
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
 
     cache.ensure_experts_resident({1: 4, 2: 3})
@@ -276,12 +271,11 @@ def test_expert_cache_keeps_requested_wave_resident_when_reusing_slots():
 
 def test_expert_cache_can_keep_prefetched_experts_resident():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=3,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
 
     cache.ensure_experts_resident(
@@ -298,12 +292,11 @@ def test_expert_cache_can_keep_prefetched_experts_resident():
 
 def test_expert_cache_protects_current_prefetch_wave_from_eviction():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
 
     cache.ensure_experts_resident(
@@ -320,12 +313,11 @@ def test_expert_cache_protects_current_prefetch_wave_from_eviction():
 
 def test_prefetch_prepare_marks_missing_without_loading():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
     cache.ensure_experts_resident({0: 10}, evict_unrequested=False)
 
@@ -339,12 +331,11 @@ def test_prefetch_prepare_marks_missing_without_loading():
 
 def test_prefetch_pager_loads_missing_without_mutating_missing_list():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
 
     assert cache.prepare_prefetch_request({2: 4}) == []
@@ -357,14 +348,34 @@ def test_prefetch_pager_loads_missing_without_mutating_missing_list():
     assert torch.equal(cache.target_for("w13_weight")[0], layer.w13_weight[2])
 
 
+def test_prefetch_pager_drains_missing_by_token_pressure():
+    layer = _MockMoELayer()
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
+        layer_id=3,
+        active_expert_budget=3,
+        sources={"w13_weight": layer.w13_weight.detach()},
+        device=torch.device("cpu"),
+    )
+
+    assert cache.prepare_prefetch_request({2: 4, 1: 9, 3: 2}) == []
+    assert cache.pager_step()
+
+    assert cache.resident_expert_ids() == {1, 2, 3}
+    assert cache.active_experts[1].gpu_slot_id == 0
+    assert cache.active_experts[2].gpu_slot_id == 1
+    assert cache.active_experts[3].gpu_slot_id == 2
+    assert cache.active_experts[1].recent_token_count == 9
+    assert cache.missing_experts == set()
+    assert cache.missing_expert_counts == {}
+
+
 def test_prefetch_pager_does_not_evict_working_expert():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
     cache.ensure_experts_resident({0: 10, 1: 1}, evict_unrequested=False)
 
@@ -377,14 +388,34 @@ def test_prefetch_pager_does_not_evict_working_expert():
     assert cache.active_experts[2].gpu_slot_id == 1
 
 
-def test_prefetch_finish_clears_completed_working_entries():
+def test_prefetch_batch_packages_resident_and_missing_waves_once():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
+    )
+    cache.ensure_experts_resident({0: 10, 3: 1}, evict_unrequested=False)
+
+    resident_waves, missing_waves = cache.prepare_prefetch_batch(
+        {0: 5, 1: 4, 2: 3, 3: 2}
+    )
+
+    assert resident_waves == [{0: 5, 3: 2}]
+    assert missing_waves == [{1: 4, 2: 3}]
+    assert cache.working_experts == {0, 1, 2, 3}
+    assert cache.missing_experts == {1, 2}
+    assert cache.missing_expert_counts == {1: 4, 2: 3}
+
+
+def test_prefetch_finish_clears_completed_working_entries():
+    layer = _MockMoELayer()
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
+        layer_id=3,
+        active_expert_budget=2,
+        sources={"w13_weight": layer.w13_weight.detach()},
+        device=torch.device("cpu"),
     )
     cache.prepare_prefetch_request({1: 4, 2: 3})
 
@@ -396,12 +427,11 @@ def test_prefetch_finish_clears_completed_working_entries():
 
 def test_prefetch_prepare_can_wait_for_pager_loaded_wave():
     layer = _MockMoELayer()
-    cache = ExpertCache.from_cpu_sources(
+    cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
     cache.start_prefetch_pager()
 
@@ -420,12 +450,11 @@ def test_prefetch_prepare_can_wait_for_pager_loaded_wave():
 
 def test_prefetch_runtime_replaces_cpu_placeholder_with_execution_target():
     layer = _MockPrefetchLayer()
-    layer.moe_offload_cache = ExpertCache.from_cpu_sources(
+    layer.moe_offload_cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
         layer_id=3,
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="prefetch",
     )
     layer.w13_weight = torch.nn.Parameter(
         layer.moe_offload_cache.target_for("w13_weight"),
@@ -441,7 +470,6 @@ def test_prefetch_runtime_replaces_cpu_placeholder_with_execution_target():
         "w13_weight"
     ).data_ptr()
 
-
 def test_expert_cache_retires_loaded_experts():
     layer = _MockMoELayer()
     cache = ExpertCache.from_cpu_sources(
@@ -449,7 +477,6 @@ def test_expert_cache_retires_loaded_experts():
         active_expert_budget=2,
         sources={"w13_weight": layer.w13_weight.detach()},
         device=torch.device("cpu"),
-        mode="passive",
     )
 
     cache.ensure_experts_resident({1: 4, 2: 3})

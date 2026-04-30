@@ -5,19 +5,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from threading import Condition, Event, RLock, Thread
 from typing import Literal
 
 import torch
 
 from vllm.logger import init_logger
 
-ExpertState = Literal["loading", "resident", "executing", "evicting"]
+ExpertState = Literal["resident", "executing", "evicting"]
 GPU_MEMORY_RETRY_SECONDS = 5
 GPU_MEMORY_RETRY_LIMIT = 10
-PAGER_LOG_INTERVAL_SECONDS = 5.0
-PAGER_POLL_SECONDS = 0.005
-PAGER_MAIN_WAIT_SECONDS = 0.002
 MAX_LOGGED_EXPERT_IDS = 16
 
 logger = init_logger(__name__)
@@ -33,7 +29,6 @@ class ActiveExpertEntry:
     loaded_step: int
     last_used_step: int
     recent_token_count: int
-    ready_event: torch.cuda.Event | None = None
 
 
 @dataclass
@@ -44,11 +39,11 @@ class _ExpertTensor:
 
 
 class ExpertCache:
-    """MoE expert cache for Case 1 passive transfer and Case 2 prefetch.
+    """Case 1 passive MoE CPU offload cache.
 
-    The CPU tensors are the source of truth. The layer parameters remain the
-    execution tensors; when an expert is demanded, its slice is copied from CPU
-    to the current parameter device before the fused MoE kernel runs.
+    CPU tensors are the source of truth. For each routed layer/wave, needed
+    experts are copied into compact GPU slots, routed ids are remapped to those
+    slots, fused MoE runs, and the caller retires the temporary slots.
     """
 
     def __init__(
@@ -57,7 +52,6 @@ class ExpertCache:
         layer_id: int,
         active_expert_budget: int | None,
         expert_tensors: list[_ExpertTensor],
-        mode: Literal["passive", "prefetch"],
         use_identity_slots: bool = True,
     ) -> None:
         if active_expert_budget is not None and active_expert_budget < 1:
@@ -67,7 +61,6 @@ class ExpertCache:
 
         self.layer_id = layer_id
         self.expert_tensors = expert_tensors
-        self.mode = mode
         self.use_identity_slots = use_identity_slots
         self.active_experts: dict[int, ActiveExpertEntry] = {}
         self.step = 0
@@ -85,16 +78,6 @@ class ExpertCache:
         self._free_slots = list(range(self._slot_count))
         self._bytes_by_expert = self._compute_bytes_by_expert()
         self._target_device = self.expert_tensors[0].target.device
-        self._last_pager_summary_time = 0.0
-        self.working_experts: set[int] = set()
-        self.missing_experts: set[int] = set()
-        self._pager_lock = RLock()
-        self._pager_condition = Condition(self._pager_lock)
-        self._pager_stop = Event()
-        self._pager_thread: Thread | None = None
-        self._copy_stream: torch.cuda.Stream | None = None
-        self._copy_stream_device: torch.device | None = None
-        self._slot_safe_events: dict[int, torch.cuda.Event] = {}
 
     @classmethod
     def from_layer(
@@ -119,7 +102,6 @@ class ExpertCache:
             layer_id=layer_id,
             active_expert_budget=active_expert_budget,
             expert_tensors=expert_tensors,
-            mode="passive",
             use_identity_slots=True,
         )
 
@@ -131,7 +113,6 @@ class ExpertCache:
         active_expert_budget: int | None,
         sources: dict[str, torch.Tensor],
         device: torch.device,
-        mode: Literal["passive", "prefetch"],
     ) -> ExpertCache:
         expert_tensors: list[_ExpertTensor] = []
         for name, source in sources.items():
@@ -145,7 +126,6 @@ class ExpertCache:
             layer_id=layer_id,
             active_expert_budget=active_expert_budget,
             expert_tensors=expert_tensors,
-            mode=mode,
             use_identity_slots=False,
         )
         cache._target_device = device
@@ -159,13 +139,13 @@ class ExpertCache:
         return source
 
     def _compute_bytes_by_expert(self) -> dict[int, int]:
-        bytes_by_expert: dict[int, int] = {}
-        for expert_id in range(self._num_experts):
-            bytes_by_expert[expert_id] = sum(
+        return {
+            expert_id: sum(
                 int(t.source[expert_id].numel() * t.source.element_size())
                 for t in self.expert_tensors
             )
-        return bytes_by_expert
+            for expert_id in range(self._num_experts)
+        }
 
     def _required_cache_bytes(self, slot_count: int) -> int:
         if not self._bytes_by_expert:
@@ -250,7 +230,6 @@ class ExpertCache:
         self._target_device = device
         self._free_slots = list(range(self._slot_count))
         self.active_experts.clear()
-        self._slot_safe_events.clear()
 
     def release_targets_to_cpu(self) -> None:
         if self.use_identity_slots:
@@ -264,86 +243,17 @@ class ExpertCache:
             )
         self._free_slots = list(range(self._slot_count))
         self.active_experts.clear()
-        self._slot_safe_events.clear()
-        with self._pager_lock:
-            self.working_experts.clear()
-            self.missing_experts.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _copy_stream_for(
-        self,
-        device: torch.device,
-    ) -> torch.cuda.Stream | None:
-        if device.type != "cuda":
-            return None
-        if self._copy_stream is None or self._copy_stream_device != device:
-            with torch.cuda.device(device):
-                self._copy_stream = torch.cuda.Stream(device=device)
-            self._copy_stream_device = device
-        return self._copy_stream
-
-    def _load_expert(
-        self,
-        expert_id: int,
-        slot_id: int,
-    ) -> torch.cuda.Event | None:
+    def _load_expert(self, expert_id: int, slot_id: int) -> None:
         self.ensure_targets_on_device(self._target_device)
         device = self.expert_tensors[0].target.device
         self._wait_for_gpu_memory(expert_id, device)
-        copy_stream = self._copy_stream_for(device)
-        if copy_stream is None:
-            for expert_tensor in self.expert_tensors:
-                source = expert_tensor.source[expert_id]
-                target = expert_tensor.target[slot_id]
-                target.copy_(source, non_blocking=True)
-            return None
-
-        with torch.cuda.device(device), torch.cuda.stream(copy_stream):
-            slot_safe_event = self._slot_safe_events.pop(slot_id, None)
-            if slot_safe_event is not None:
-                copy_stream.wait_event(slot_safe_event)
-            for expert_tensor in self.expert_tensors:
-                source = expert_tensor.source[expert_id]
-                target = expert_tensor.target[slot_id]
-                target.copy_(source, non_blocking=True)
-            ready_event = torch.cuda.Event()
-            ready_event.record(copy_stream)
-        return ready_event
-
-    def _wait_for_copy_event(self, event: torch.cuda.Event | None) -> None:
-        if event is None:
-            return
-        event.synchronize()
-
-    def wait_for_experts_ready(self, expert_ids: set[int]) -> None:
-        if self._target_device.type != "cuda":
-            return
-        stream = torch.cuda.current_stream(self._target_device)
-        for expert_id in expert_ids:
-            entry = self.active_experts.get(expert_id)
-            if entry is None:
-                raise RuntimeError(
-                    f"Expert {expert_id} is not resident in the MoE offload cache"
-                )
-            if entry.ready_event is not None:
-                stream.wait_event(entry.ready_event)
-            entry.state = "executing"
-
-    def mark_experts_available(self, expert_ids: set[int]) -> None:
-        if not expert_ids:
-            return
-        use_event: torch.cuda.Event | None = None
-        if self._target_device.type == "cuda":
-            use_event = torch.cuda.Event()
-            use_event.record(torch.cuda.current_stream(self._target_device))
-        for expert_id in expert_ids:
-            entry = self.active_experts.get(expert_id)
-            if entry is None:
-                continue
-            entry.state = "resident"
-            if use_event is not None:
-                self._slot_safe_events[entry.gpu_slot_id] = use_event
+        for expert_tensor in self.expert_tensors:
+            source = expert_tensor.source[expert_id]
+            target = expert_tensor.target[slot_id]
+            target.copy_(source, non_blocking=True)
 
     def _allocate_slot(self, expert_id: int) -> int:
         if self.use_identity_slots:
@@ -393,31 +303,6 @@ class ExpertCache:
         while len(self.active_experts) >= self.active_expert_budget:
             self._evict_one(protected_expert_ids)
 
-    def _reserve_pager_slot_locked(
-        self,
-    ) -> tuple[int, int | None] | None:
-        if self._free_slots:
-            return self._free_slots.pop(0), None
-
-        candidates = [
-            entry
-            for entry in self.active_experts.values()
-            if (
-                entry.state != "executing"
-                and entry.expert_id not in self.working_experts
-            )
-        ]
-        if not candidates:
-            return None
-
-        victim = min(
-            candidates,
-            key=lambda entry: (entry.recent_token_count, entry.last_used_step),
-        )
-        victim.state = "evicting"
-        del self.active_experts[victim.expert_id]
-        return victim.gpu_slot_id, victim.expert_id
-
     @staticmethod
     def _format_expert_ids(expert_ids: set[int]) -> str:
         sorted_ids = sorted(expert_ids)
@@ -429,47 +314,8 @@ class ExpertCache:
         )
         return f"[{', '.join(str(expert_id) for expert_id in visible_ids)}{suffix}]"
 
-    def _log_pager_state(
-        self,
-        *,
-        event: str,
-        working_experts: set[int],
-        missing_experts: set[int],
-        force: bool = False,
-    ) -> None:
+    def _log_passive_transfer(self, *, active_experts: set[int]) -> None:
         if self.use_identity_slots:
-            return
-
-        now = time.monotonic()
-        if (
-            not force
-            and now - self._last_pager_summary_time < PAGER_LOG_INTERVAL_SECONDS
-        ):
-            return
-        self._last_pager_summary_time = now
-
-        active_experts = set(self.active_experts)
-        logger.debug(
-            "MoE expert pager layer=%d event=%s active_model_list=%s "
-            "working_model_list=%s missing_model_list=%s resident=%d/%d "
-            "free_slots=%d step=%d",
-            self.layer_id,
-            event,
-            self._format_expert_ids(active_experts),
-            self._format_expert_ids(working_experts),
-            self._format_expert_ids(missing_experts),
-            len(active_experts),
-            self.active_expert_budget,
-            len(self._free_slots),
-            self.step,
-        )
-
-    def _log_passive_transfer(
-        self,
-        *,
-        active_experts: set[int],
-    ) -> None:
-        if self.mode != "passive" or self.use_identity_slots:
             return
 
         logger.debug(
@@ -502,17 +348,8 @@ class ExpertCache:
             )
         required_experts = set(expert_token_counts)
         missing_experts = required_experts - set(self.active_experts)
-        if missing_experts and self.mode == "prefetch":
-            self._log_pager_state(
-                event="miss",
-                working_experts=required_experts,
-                missing_experts=missing_experts,
-                force=True,
-            )
-        elif missing_experts:
-            self._log_passive_transfer(
-                active_experts=required_experts,
-            )
+        if missing_experts:
+            self._log_passive_transfer(active_experts=required_experts)
         if not self.use_identity_slots and evict_unrequested:
             for expert_id in list(self.active_experts):
                 if expert_id not in required_experts:
@@ -526,8 +363,7 @@ class ExpertCache:
             entry = self.active_experts.get(expert_id)
             if entry is None:
                 slot_id = self._allocate_slot(expert_id)
-                ready_event = self._load_expert(expert_id, slot_id)
-                self._wait_for_copy_event(ready_event)
+                self._load_expert(expert_id, slot_id)
                 entry = ActiveExpertEntry(
                     layer_id=self.layer_id,
                     expert_id=expert_id,
@@ -537,164 +373,12 @@ class ExpertCache:
                     loaded_step=self.step,
                     last_used_step=self.step,
                     recent_token_count=token_count,
-                    ready_event=None,
                 )
                 self.active_experts[expert_id] = entry
             else:
                 entry.state = "resident"
                 entry.last_used_step = self.step
                 entry.recent_token_count = token_count
-        if self.mode == "prefetch":
-            self._log_pager_state(
-                event="summary",
-                working_experts=required_experts,
-                missing_experts=set(),
-            )
-
-    def start_prefetch_pager(self) -> None:
-        if self.mode != "prefetch" or self.use_identity_slots:
-            return
-        if self._pager_thread is not None:
-            return
-        self._pager_stop.clear()
-        self._pager_thread = Thread(
-            target=self._prefetch_pager_loop,
-            name=f"moe-prefetch-pager-layer-{self.layer_id}",
-            daemon=True,
-        )
-        self._pager_thread.start()
-
-    def stop_prefetch_pager(self) -> None:
-        self._pager_stop.set()
-        with self._pager_condition:
-            self._pager_condition.notify_all()
-
-    def _prefetch_pager_loop(self) -> None:
-        while not self._pager_stop.is_set():
-            loaded = self.pager_step()
-            if loaded:
-                continue
-            with self._pager_condition:
-                self._pager_condition.wait(timeout=PAGER_POLL_SECONDS)
-
-    def prepare_prefetch_request(
-        self,
-        expert_token_counts: dict[int, int],
-        *,
-        wait_for_resident: bool = False,
-    ) -> list[dict[int, int]]:
-        """Publish routed demand and return resident expert waves to compute."""
-        if self.mode != "prefetch" or self.use_identity_slots:
-            return self.expert_batches_for_counts(expert_token_counts)
-        if not expert_token_counts:
-            return []
-
-        self._fit_auto_budget_to_available_memory(len(expert_token_counts))
-        requested_experts = set(expert_token_counts)
-        with self._pager_condition:
-            self.step += 1
-            self.working_experts = set(requested_experts)
-            missing_experts = requested_experts - set(self.active_experts)
-            self.missing_experts = set(missing_experts)
-            if missing_experts:
-                self._log_pager_state(
-                    event="miss",
-                    working_experts=self.working_experts,
-                    missing_experts=self.missing_experts,
-                    force=True,
-                )
-            self._pager_condition.notify_all()
-            while wait_for_resident and missing_experts:
-                self._pager_condition.wait(timeout=PAGER_MAIN_WAIT_SECONDS)
-                missing_experts = requested_experts - set(self.active_experts)
-                self.missing_experts = set(missing_experts)
-            resident_counts = {
-                expert_id: token_count
-                for expert_id, token_count in expert_token_counts.items()
-                if expert_id in self.active_experts
-            }
-            for expert_id, token_count in resident_counts.items():
-                entry = self.active_experts[expert_id]
-                entry.last_used_step = self.step
-                entry.recent_token_count = token_count
-
-        sorted_counts = sorted(
-            resident_counts.items(), key=lambda item: (-item[1], item[0])
-        )
-        return [
-            dict(sorted_counts[index : index + self.active_expert_budget])
-            for index in range(0, len(sorted_counts), self.active_expert_budget)
-        ]
-
-    def finish_prefetch_request(self, expert_ids: set[int]) -> None:
-        if self.mode != "prefetch" or self.use_identity_slots:
-            return
-        with self._pager_condition:
-            self.mark_experts_available(expert_ids)
-            self.working_experts.difference_update(expert_ids)
-            self._log_pager_state(
-                event="summary",
-                working_experts=self.working_experts,
-                missing_experts=self.missing_experts,
-            )
-            self._pager_condition.notify_all()
-
-    def pager_step(self) -> bool:
-        """Load one missing expert into an evictable GPU slot."""
-        if self.mode != "prefetch" or self.use_identity_slots:
-            return False
-
-        self.ensure_targets_on_device(self._target_device)
-        with self._pager_condition:
-            missing_candidates = sorted(
-                expert_id
-                for expert_id in self.missing_experts
-                if expert_id not in self.active_experts
-            )
-            if not missing_candidates:
-                return False
-            expert_id = missing_candidates[0]
-            reserved = self._reserve_pager_slot_locked()
-            if reserved is None:
-                self._log_pager_state(
-                    event="wait",
-                    working_experts=self.working_experts,
-                    missing_experts=self.missing_experts,
-                )
-                return False
-            slot_id, _victim_id = reserved
-
-        try:
-            ready_event = self._load_expert(expert_id, slot_id)
-        except Exception:
-            with self._pager_condition:
-                if slot_id not in self._free_slots:
-                    self._free_slots.append(slot_id)
-                    self._free_slots.sort()
-                self._pager_condition.notify_all()
-            raise
-
-        with self._pager_condition:
-            self.active_experts[expert_id] = ActiveExpertEntry(
-                layer_id=self.layer_id,
-                expert_id=expert_id,
-                gpu_slot_id=slot_id,
-                state="resident",
-                weight_bytes=self._bytes_by_expert[expert_id],
-                loaded_step=self.step,
-                last_used_step=self.step,
-                recent_token_count=0,
-                ready_event=ready_event,
-            )
-            self.missing_experts.discard(expert_id)
-            self._log_pager_state(
-                event="load",
-                working_experts=self.working_experts,
-                missing_experts=self.missing_experts,
-                force=True,
-            )
-            self._pager_condition.notify_all()
-        return True
 
     def resident_expert_ids(self) -> set[int]:
         return set(self.active_experts)
@@ -725,30 +409,31 @@ class ExpertCache:
         if self.use_identity_slots:
             return topk_ids
 
-        remapped = torch.empty_like(topk_ids)
-        flat_in = topk_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1)
-        flat_out = remapped.reshape(-1)
-        cpu_expert_map = None
-        if expert_map is not None:
-            cpu_expert_map = expert_map.detach().to(device="cpu", dtype=torch.long)
+        slot_map = torch.full(
+            (self._num_experts,),
+            -1,
+            dtype=torch.long,
+            device=topk_ids.device,
+        )
+        for expert_id, entry in self.active_experts.items():
+            slot_map[expert_id] = entry.gpu_slot_id
 
-        for index, raw_expert_id in enumerate(flat_in.tolist()):
-            if raw_expert_id < 0:
-                flat_out[index] = raw_expert_id
-                continue
-            expert_id = raw_expert_id
-            if cpu_expert_map is not None:
-                if raw_expert_id >= cpu_expert_map.numel():
-                    flat_out[index] = -1
-                    continue
-                expert_id = int(cpu_expert_map[raw_expert_id].item())
-            entry = self.active_experts.get(expert_id)
-            if entry is None:
-                raise RuntimeError(
-                    f"Expert {expert_id} is not resident in the MoE offload cache"
-                )
-            flat_out[index] = entry.gpu_slot_id
-        return remapped
+        local_ids = local_expert_ids_for_topk(
+            topk_ids,
+            local_num_experts=self._num_experts,
+            expert_map=expert_map,
+        )
+        valid_local_ids = (local_ids >= 0) & (local_ids < self._num_experts)
+        safe_local_ids = torch.where(valid_local_ids, local_ids, 0)
+        slot_ids = slot_map[safe_local_ids]
+        missing = valid_local_ids & (slot_ids < 0)
+        if bool(torch.any(missing).item()):
+            missing_ids = torch.unique(local_ids[missing], sorted=True)
+            missing_id = int(missing_ids[0].to(device="cpu").item())
+            raise RuntimeError(
+                f"Expert {missing_id} is not resident in the MoE offload cache"
+            )
+        return torch.where(valid_local_ids, slot_ids, -1).to(dtype=topk_ids.dtype)
 
     def ensure_experts_resident_and_remap(
         self,
@@ -793,35 +478,57 @@ class ExpertCache:
         if self.use_identity_slots:
             return topk_ids, topk_weights
 
-        remapped = torch.zeros_like(topk_ids)
-        weights = torch.zeros_like(topk_weights)
-        flat_in = topk_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1)
-        flat_remapped = remapped.reshape(-1)
-        flat_weights = weights.reshape(-1)
-        flat_source_weights = topk_weights.reshape(-1)
-        cpu_expert_map = None
-        if expert_map is not None:
-            cpu_expert_map = expert_map.detach().to(device="cpu", dtype=torch.long)
-
-        for index, raw_expert_id in enumerate(flat_in.tolist()):
-            if raw_expert_id < 0:
-                continue
-            expert_id = raw_expert_id
-            if cpu_expert_map is not None:
-                if raw_expert_id >= cpu_expert_map.numel():
-                    continue
-                expert_id = int(cpu_expert_map[raw_expert_id].item())
-            if expert_id not in local_expert_ids:
-                continue
+        slot_map = torch.full(
+            (self._num_experts,),
+            -1,
+            dtype=torch.long,
+            device=topk_ids.device,
+        )
+        for expert_id in local_expert_ids:
             entry = self.active_experts.get(expert_id)
             if entry is None:
                 raise RuntimeError(
                     f"Expert {expert_id} is not resident in the MoE offload cache"
                 )
-            flat_remapped[index] = entry.gpu_slot_id
-            flat_weights[index] = flat_source_weights[index]
+            slot_map[expert_id] = entry.gpu_slot_id
+
+        local_ids = local_expert_ids_for_topk(
+            topk_ids,
+            local_num_experts=self._num_experts,
+            expert_map=expert_map,
+        )
+        valid_local_ids = (local_ids >= 0) & (local_ids < self._num_experts)
+        safe_local_ids = torch.where(valid_local_ids, local_ids, 0)
+        slot_ids = slot_map[safe_local_ids]
+        selected = valid_local_ids & (slot_ids >= 0)
+        remapped = torch.where(selected, slot_ids, 0).to(dtype=topk_ids.dtype)
+        weights = torch.where(selected, topk_weights, torch.zeros_like(topk_weights))
 
         return remapped, weights
+
+
+def local_expert_ids_for_topk(
+    topk_ids: torch.Tensor,
+    *,
+    local_num_experts: int,
+    expert_map: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return routed local expert ids on the same device as ``topk_ids``."""
+    ids = topk_ids.to(dtype=torch.long)
+    valid_raw_ids = ids >= 0
+
+    if expert_map is None:
+        local_ids = ids
+    else:
+        expert_map = expert_map.to(device=ids.device, dtype=torch.long)
+        valid_raw_ids &= ids < expert_map.numel()
+        safe_ids = torch.where(valid_raw_ids, ids, 0)
+        local_ids = expert_map[safe_ids]
+
+    valid_local_ids = valid_raw_ids & (local_ids >= 0) & (
+        local_ids < local_num_experts
+    )
+    return torch.where(valid_local_ids, local_ids, -1)
 
 
 def local_expert_token_counts(
@@ -830,26 +537,21 @@ def local_expert_token_counts(
     local_num_experts: int,
     expert_map: torch.Tensor | None,
 ) -> dict[int, int]:
-    """Return token counts keyed by local expert id."""
-    ids = topk_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1)
-    counts: dict[int, int] = {}
+    """Return compact token counts keyed by local expert id."""
+    local_ids = local_expert_ids_for_topk(
+        topk_ids,
+        local_num_experts=local_num_experts,
+        expert_map=expert_map,
+    )
+    routed_ids = local_ids[local_ids >= 0]
+    if routed_ids.numel() == 0:
+        return {}
 
-    cpu_expert_map = None
-    if expert_map is not None:
-        cpu_expert_map = expert_map.detach().to(device="cpu", dtype=torch.long)
-
-    for raw_expert_id in ids.tolist():
-        if raw_expert_id < 0:
-            continue
-        expert_id = raw_expert_id
-        if cpu_expert_map is not None:
-            if raw_expert_id >= cpu_expert_map.numel():
-                continue
-            expert_id = int(cpu_expert_map[raw_expert_id].item())
-            if expert_id < 0:
-                continue
-        if expert_id >= local_num_experts:
-            continue
-        counts[expert_id] = counts.get(expert_id, 0) + 1
-
-    return counts
+    counts = torch.bincount(routed_ids, minlength=local_num_experts)
+    active_ids = torch.nonzero(counts, as_tuple=False).reshape(-1)
+    cpu_active_ids = active_ids.to(device="cpu", dtype=torch.long)
+    cpu_counts = counts[active_ids].to(device="cpu", dtype=torch.long)
+    return {
+        int(expert_id): int(count)
+        for expert_id, count in zip(cpu_active_ids.tolist(), cpu_counts.tolist())
+    }

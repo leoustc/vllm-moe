@@ -33,6 +33,9 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
+from vllm.model_executor.layers.fused_moe.moe_gpu_prefetch import (
+    MoeGpuPrefetchExpertCache,
+)
 from vllm.model_executor.layers.fused_moe.moe_offload import (
     ExpertCache,
 )
@@ -300,7 +303,7 @@ class FusedMoE(PluggableLayer):
 
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
-        self.moe_offload_cache: ExpertCache | None = None
+        self.moe_offload_cache: ExpertCache | MoeGpuPrefetchExpertCache | None = None
 
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
@@ -692,13 +695,20 @@ class FusedMoE(PluggableLayer):
         device = torch.device(self.vllm_config.device_config.device)
         if torch.cuda.is_available() and device.type == "cuda":
             device = torch.device("cuda", torch.cuda.current_device())
-        self.moe_offload_cache = ExpertCache.from_cpu_sources(
-            layer_id=self.layer_id,
-            active_expert_budget=self.moe_gpu_prefetch_budget,
-            sources=sources,
-            device=device,
-            mode="prefetch" if self.moe_gpu_prefetch_enabled else "passive",
-        )
+        if self.moe_gpu_prefetch_enabled:
+            self.moe_offload_cache = MoeGpuPrefetchExpertCache.from_cpu_sources(
+                layer_id=self.layer_id,
+                active_expert_budget=self.moe_gpu_prefetch_budget,
+                sources=sources,
+                device=device,
+            )
+        else:
+            self.moe_offload_cache = ExpertCache.from_cpu_sources(
+                layer_id=self.layer_id,
+                active_expert_budget=None,
+                sources=sources,
+                device=device,
+            )
         if self.moe_gpu_startup_prefetch_enabled:
             prefetch_count = self.moe_gpu_prefetch_budget or 1
             prefetch_count = min(prefetch_count, int(self.local_num_experts))
@@ -714,7 +724,8 @@ class FusedMoE(PluggableLayer):
         for name in sources:
             if name in ("w13_weight", "w2_weight", "w13_bias", "w2_bias"):
                 replace_parameter(self, name, self.moe_offload_cache.target_for(name))
-        self.moe_offload_cache.start_prefetch_pager()
+        if self.moe_gpu_prefetch_enabled:
+            self.moe_offload_cache.start_prefetch_pager()
 
     def move_moe_offload_cache_to_device(self, device: torch.device) -> None:
         if self.moe_offload_cache is None:
