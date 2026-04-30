@@ -19,6 +19,8 @@ TEST_CASE_BENCH_INPUT_LEN ?= 64
 TEST_CASE_BENCH_OUTPUT_LEN ?= 64
 TEST_CASE_BENCH_CONCURRENCY ?= 8
 TEST_CASE2_PREFETCH ?= 64
+TEST_CASE2_PREFETCH_LIST ?= 16 32 64
+TEST_CASE2_GPU_MEMORY_UTILIZATION_LIST ?= 0.95
 TEST_CASE2_BENCH_NUM_PROMPTS ?= 16
 TEST_CASE2_BENCH_REQUEST_RATE ?= 8
 TEST_CASE2_BENCH_CONCURRENCY ?= 16
@@ -153,16 +155,30 @@ test-case1: clean-vllm
 	PORT=$(TEST_CASE1_PORT) ./bench_vllm.sh
 
 test-case2: clean-vllm
-	GPU_MEMORY_UTILIZATION=0.95 \
-	VLLM_BIN=$(VLLM) \
-	MODEL_PATH=$(MODEL_PATH) \
-	GPU=$(TEST_CASE_GPU) PORT=$(TEST_CASE2_PORT) VLLM_EXTRA_ARGS="--moe-gpu-prefetch $(TEST_CASE2_PREFETCH)" ./run_vllm.sh
-	NUM_PROMPTS=$(TEST_CASE2_BENCH_NUM_PROMPTS) \
-	REQUEST_RATE=$(TEST_CASE2_BENCH_REQUEST_RATE) \
-	RANDOM_INPUT_LEN=$(TEST_CASE_BENCH_INPUT_LEN) \
-	RANDOM_OUTPUT_LEN=$(TEST_CASE_BENCH_OUTPUT_LEN) \
-	MAX_CONCURRENCY=$(TEST_CASE2_BENCH_CONCURRENCY) \
-	PORT=$(TEST_CASE2_PORT) ./bench_vllm.sh
+	@for gpu_limit in $(TEST_CASE2_GPU_MEMORY_UTILIZATION_LIST); do \
+		for prefetch in $(TEST_CASE2_PREFETCH_LIST); do \
+			echo "============================================================"; \
+			echo "Case 2 benchmark: gpu_memory_utilization=$${gpu_limit} prefetch=$${prefetch}"; \
+			echo "============================================================"; \
+			./clean_vllm.sh; \
+			GPU_MEMORY_UTILIZATION=$${gpu_limit} \
+			VLLM_BIN=$(VLLM) \
+			MODEL_PATH=$(MODEL_PATH) \
+			GPU=$(TEST_CASE_GPU) PORT=$(TEST_CASE2_PORT) VLLM_EXTRA_ARGS="--moe-gpu-prefetch $${prefetch}" ./run_vllm.sh || { \
+				echo "Case 2 startup failed: gpu_memory_utilization=$${gpu_limit} prefetch=$${prefetch}"; \
+				continue; \
+			}; \
+			NUM_PROMPTS=$(TEST_CASE2_BENCH_NUM_PROMPTS) \
+			REQUEST_RATE=$(TEST_CASE2_BENCH_REQUEST_RATE) \
+			RANDOM_INPUT_LEN=$(TEST_CASE_BENCH_INPUT_LEN) \
+			RANDOM_OUTPUT_LEN=$(TEST_CASE_BENCH_OUTPUT_LEN) \
+			MAX_CONCURRENCY=$(TEST_CASE2_BENCH_CONCURRENCY) \
+			PORT=$(TEST_CASE2_PORT) ./bench_vllm.sh || { \
+				echo "Case 2 benchmark failed: gpu_memory_utilization=$${gpu_limit} prefetch=$${prefetch}"; \
+				continue; \
+			}; \
+		done; \
+	done
 
 test-case:
 	$(MAKE) test-case1
