@@ -27,6 +27,8 @@ Common settings:
 | 0.95 | 16 | 21.71 | OK |
 | 0.95 | 32 | 33.86 | OK |
 | 0.95 | 64 | 56.51 | OK |
+| 0.95 | 72 | 60.31 | OK |
+| 0.95 | 96 | NA | active expert cache startup failure |
 
 ## Bench Details
 
@@ -134,3 +136,26 @@ Common settings:
 - Mean TPOT: `236.61 ms`
 - Mean ITL: `232.92 ms`
 - Log: `logs/test_case2_gpu095_20260430T213450_SGT.log`
+
+### GPU limit 0.95, prefetch 72
+
+- Status: OK
+- Successful requests: `16`
+- Benchmark duration: `16.98 s`
+- Total input tokens: `1236`
+- Total generated tokens: `1024`
+- Request throughput: `0.94 req/s`
+- Output token throughput: `60.31 tok/s`
+- Mean TTFT: `1914.17 ms`
+- Mean TPOT: `219.67 ms`
+- Mean ITL: `216.24 ms`
+- Log: `logs/test_case2_gpu095_prefetch72_96_20260430T220459_SGT.log`
+
+### GPU limit 0.95, prefetch 96
+
+- Status: NA
+- Failure: active expert cache GPU memory startup failure
+- Failed layer: `29`
+- Required active expert cache memory: `1141899264 bytes`
+- Free GPU memory after retries: `459800576 bytes`
+- Log: `logs/test_case2_gpu095_prefetch72_96_20260430T220459_SGT.log`
