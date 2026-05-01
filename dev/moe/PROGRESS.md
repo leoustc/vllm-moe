@@ -210,3 +210,135 @@ Port ladder:
 
 Use `./clean_vllm.sh` or `make clean-vllm` to stop servers recorded by port pid
 files.
+
+## 2026-05-01 Handoff: Harness Split and Locality Bench
+
+Repository split:
+
+- Source implementation remains in `leoustc/vllm-moe`.
+- Harness/docs/scripts are being split into `leoustc/harness-vllm-moe`.
+- The current harness folder is `dev/moe` in the source checkout, but the user
+  plans to reorganize the harness folder path and reload Codex later.
+- Keep implementation/source changes separate from harness changes unless the
+  user explicitly asks to sync them.
+
+Harness repo status:
+
+- Pushed `dev/moe` harness contents to
+  `git@github.com:leoustc/harness-vllm-moe.git`.
+- The push used HTTPS through `gh` auth because local SSH clone access was
+  rejected, but the target repo is still the requested GitHub repo.
+- Harness repo commit:
+  `4d0a1a3 Add vLLM MoE harness`.
+- Published harness files include docs, `Makefile`, `run_vllm.sh`,
+  `bench_vllm.sh`, `test_vllm.sh`, `clean_vllm.sh`, `run_codex.sh`,
+  `bench_page_size.sh`, and `site.conf`.
+- Generated artifacts were intentionally excluded: `.venv/`, `logs/`,
+  `.coding/`, `.debug/`, `.review/`, `*.pid`, and bench log outputs.
+
+Recent benchmark PRs in source repo:
+
+- PR #8 merged: `[codex] Add Case 2 benchmark sweep report`.
+- PR #9 opened as draft against `main`:
+  `https://github.com/leoustc/vllm-moe/pull/9`.
+- Latest benchmark docs updated in both `BENCHMARK.md` and
+  `dev/moe/CASE2_BENCH_SESSION1.md`.
+
+Case 2 benchmark results so far:
+
+| GPU limit | Prefetch num | Output tok/s | Status |
+|---:|---:|---:|---|
+| 0.50 | 16 | 20.43 | OK |
+| 0.50 | 32 | NA | KV cache startup failure |
+| 0.50 | 64 | NA | KV cache startup failure |
+| 0.75 | 16 | 20.64 | OK |
+| 0.75 | 32 | 34.78 | OK |
+| 0.75 | 64 | NA | KV cache startup failure |
+| 0.95 | 16 | 21.71 | OK |
+| 0.95 | 32 | 33.86 | OK |
+| 0.95 | 64 | 56.51 | OK |
+| 0.95 | 72 | 60.31 | OK |
+| 0.95 | 96 | NA | active expert cache startup failure |
+
+Important benchmark logs:
+
+- `logs/test_case2_grid_20260430T091110Z.log`:
+  `0.50` and `0.75` rows.
+- `logs/test_case2_gpu095_20260430T213450_SGT.log`:
+  `0.95` rows for prefetch `16`, `32`, `64`.
+- `logs/test_case2_gpu095_prefetch72_96_20260430T220459_SGT.log`:
+  `0.95` rows for prefetch `72`, `96`.
+- Prefetch `96` failed at startup because layer `29` could not allocate active
+  expert cache memory: required `1141899264` bytes, only `459800576` bytes free
+  after retries.
+
+Current locality test plan:
+
+- A new harness-only folder `locality/` has been added under the current
+  harness path.
+- The goal is to test active-expert locality by sending repeated prompts to the
+  same vLLM endpoint and inspecting Case 2 pager behavior.
+- Use vLLM's own benchmark command instead of a hand-written curl loop.
+- The locality dataset shape is `100` prompt groups, each repeated `32` times,
+  for `3200` total requests.
+- The dataset is a custom JSONL file for `vllm bench serve` with rows containing
+  `prompt`, `output_tokens`, `group_id`, and `repeat_id`.
+- The script runs with `--dataset-name custom`, `--dataset-path <jsonl>`, and
+  `--disable-shuffle` so each 32-repeat prompt group stays adjacent.
+
+Current locality files:
+
+- `locality/bench_repeated_prompts.sh`
+- `locality/README.md`
+- `.gitignore` now ignores generated `locality/logs` and `locality/data`.
+
+Default locality command:
+
+```bash
+PORT=8062 ./locality/bench_repeated_prompts.sh
+```
+
+Default locality settings:
+
+```text
+PROMPT_GROUPS=100
+REPEATS_PER_PROMPT=32
+NUM_PROMPTS=3200
+OUTPUT_LEN=64
+REQUEST_RATE=8
+MAX_CONCURRENCY=16
+TEMPERATURE=0
+```
+
+Locality outputs:
+
+- Generated dataset:
+  `locality/data/repeated_prompts_100x32.jsonl`
+- Full benchmark output:
+  `locality/logs/repeated_prompts_<port>_<timestamp>.log`
+- Captured MoE pager lines:
+  `locality/logs/repeated_prompts_<port>_<timestamp>.pager.log`
+- vLLM detailed result JSON:
+  `locality/logs/bench-results/`
+
+Validation already done for locality harness:
+
+```bash
+bash -n locality/bench_repeated_prompts.sh
+PROMPT_GROUPS=2 REPEATS_PER_PROMPT=3 OUTPUT_LEN=7 DATA_DIR=<tmp>/data LOG_DIR=<tmp>/logs BASE_URL=http://127.0.0.1:9 HEALTH_TIMEOUT_SECONDS=0 ./locality/bench_repeated_prompts.sh
+```
+
+The smoke command intentionally failed health check on port `9`, but it
+successfully generated a six-line dataset with three adjacent repeats for each
+of two prompt groups.
+
+Next plan after reload/reorg:
+
+1. Place `locality/` in the reorganized harness repo path.
+2. Start a Case 2 vLLM server, likely with the current best single-GPU setting:
+   `GPU_MEMORY_UTILIZATION=0.95` and `--moe-gpu-prefetch 72`.
+3. Run `PORT=<server_port> ./locality/bench_repeated_prompts.sh`.
+4. Compare locality benchmark throughput and pager log behavior against the
+   random-prompt Case 2 benchmark.
+5. Inspect whether repeated prompt groups reduce missing expert pressure and
+   improve resident expert hit rate.
