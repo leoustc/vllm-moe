@@ -4,7 +4,7 @@ Case 2 benchmark sweep for `--moe-gpu-prefetch` with fixed benchmark load.
 
 Common settings:
 
-- GPU: `4`
+- GPU: `4` (`NVIDIA A100-SXM4-40GB`)
 - Model: `/models/gemma-4-26B-A4B-it`
 - Port: `8062`
 - Benchmark prompts: `16`

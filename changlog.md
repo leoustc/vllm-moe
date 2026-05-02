@@ -40,8 +40,8 @@ memory to GPU memory during execution.
 dev/moe/.venv/bin/python -m pytest tests/kernels/moe/test_moe_cpu_offload.py -q
 ```
 
-- Harness validation has covered one `gemma-4-26B-A4B-it` endpoint on one 40GB
-  GPU and two `gemma-4-26B-A4B-it` endpoints sharing one 40GB GPU.
+- Harness validation has covered one `gemma-4-26B-A4B-it` endpoint on one A100
+  40GB GPU and two `gemma-4-26B-A4B-it` endpoints sharing one A100 40GB GPU.
 
 ## 2026-04-28: Case 2 GPU Active Expert Prefetch
 

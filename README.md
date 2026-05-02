@@ -7,7 +7,7 @@ This branch adds two independent MoE offload execution modes to vLLM:
 --moe-gpu-prefetch <num>
 ```
 
-> ## Run 26B MoE model on 40GB GPU, with output token throughput: **55.32** tok/s
+> ## Run 26B MoE model on A100 40GB GPU, with output token throughput: **55.32** tok/s
 
 
 The original upstream vLLM README is preserved at [README.old](README.old).
@@ -139,8 +139,8 @@ short.
 The local harness validated:
 
 - dense/base vLLM compatibility with MoE flags ignored,
-- one `gemma-4-26B-A4B-it` MoE model on one 40GB GPU,
-- two `gemma-4-26B-A4B-it` MoE model instances sharing one 40GB GPU from
+- one `gemma-4-26B-A4B-it` MoE model on one A100 40GB GPU,
+- two `gemma-4-26B-A4B-it` MoE model instances sharing one A100 40GB GPU from
   separate vLLM endpoints,
 - valid completion responses from all tested endpoints,
 - both independent MoE offload harness paths.

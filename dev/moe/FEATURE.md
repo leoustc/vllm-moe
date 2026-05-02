@@ -63,7 +63,7 @@ Latest validation:
 - Dense sanity path passed with `--moe-cpu-offload` ignored.
 - MoE single-endpoint path passed with passive CPU offload enabled.
 - MoE dual-endpoint path passed with two `gemma-4-26B-A4B-it` endpoints sharing
-  one 40GB GPU.
+  one A100 40GB GPU.
 
 ## Case 2: CPU Offload With GPU Active Model Prefetch
 

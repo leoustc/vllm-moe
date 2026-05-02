@@ -71,9 +71,9 @@ vllm/model_executor/layers/fused_moe/moe_gpu_prefetch.py
 
 ### Example Test Layout
 
-- Endpoint 1: one `gemma-4-26B-A4B-it` MoE model on one 40GB GPU.
+- Endpoint 1: one `gemma-4-26B-A4B-it` MoE model on one A100 40GB GPU.
 - Endpoint 2 and 3: two `gemma-4-26B-A4B-it` MoE model instances sharing one
-  40GB GPU, each served from a separate vLLM endpoint.
+  A100 40GB GPU, each served from a separate vLLM endpoint.
 - This validates the intended use case: passive expert loading lets large MoE
   models fit on smaller GPU memory budgets and allows multiple large MoE
   endpoints to colocate on the same GPU.
