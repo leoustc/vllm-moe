@@ -213,10 +213,41 @@ def test_moe_gpu_prefetch_enables_for_moe_model(monkeypatch):
     assert config.moe_offload_config.enabled is True
     assert config.moe_offload_config.mode == "prefetch"
     assert config.moe_offload_config.gpu_prefetch == 2
-    assert config.moe_offload_config.effective_gpu_prefetch == 12
+    assert config.moe_offload_config.effective_gpu_prefetch == 8
     assert log_messages == [
         "MoE GPU prefetch enabled: total experts=0, active experts=8, "
-        "requested prefetch=2, effective prefetch=12."
+        "requested prefetch=2, effective prefetch=8."
+    ]
+
+
+def test_moe_gpu_prefetch_caps_at_total_experts(monkeypatch):
+    monkeypatch.setattr(ModelConfig, "is_moe", property(lambda self: True))
+    monkeypatch.setattr(moe_offload_cli, "_get_num_experts", lambda _: 8)
+    monkeypatch.setattr(moe_offload_cli, "_get_active_expert_count", lambda _: 4)
+    log_messages = []
+    monkeypatch.setattr(
+        moe_offload_cli.logger,
+        "info",
+        lambda message, *args: log_messages.append(message % args if args else message),
+    )
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args([
+        "--model",
+        "facebook/opt-125m",
+        "--moe-gpu-prefetch",
+        "10",
+    ])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    config = engine_args.create_engine_config()
+
+    assert config.moe_offload_config.enabled is True
+    assert config.moe_offload_config.mode == "prefetch"
+    assert config.moe_offload_config.gpu_prefetch == 10
+    assert config.moe_offload_config.effective_gpu_prefetch == 8
+    assert log_messages == [
+        "MoE GPU prefetch enabled: total experts=8, active experts=4, "
+        "requested prefetch=10, effective prefetch=8."
     ]
 
 

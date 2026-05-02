@@ -11,7 +11,6 @@ Case 1 passive path and Case 2 prefetch path can consume it.
 from __future__ import annotations
 
 from argparse import ArgumentParser, ArgumentTypeError, Namespace
-from math import ceil
 from typing import Any
 
 from vllm.config import MoEOffloadConfig
@@ -91,10 +90,14 @@ def _make_config_from_args(args_obj: Any) -> MoEOffloadConfig:
 def _effective_gpu_prefetch(
     requested: int,
     active_experts: int | None,
+    total_experts: int | None,
 ) -> int:
-    if active_experts is None or requested >= active_experts:
-        return requested
-    return ceil(active_experts * 1.5)
+    effective = requested
+    if active_experts is not None and active_experts > 0:
+        effective = max(effective, active_experts)
+    if total_experts is not None and total_experts > 0:
+        effective = min(effective, total_experts)
+    return effective
 
 
 def _get_num_experts(model_config: Any) -> int | None:
@@ -208,6 +211,7 @@ def patch_engine_args() -> None:
             effective_prefetch = _effective_gpu_prefetch(
                 requested_prefetch,
                 active_experts,
+                num_experts,
             )
             moe_offload_config = MoEOffloadConfig(
                 enabled=True,
